@@ -1,0 +1,48 @@
+name: Release Github Bulk Env Updator
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger only on version tags like v1.0.0
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          ext=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            ext=".exe"
+          fi
+          name=gh-env-secrets-${{ matrix.goos }}-${{ matrix.goarch }}
+          out=dist/$name$ext
+          zip=dist/$name.zip
+          go build -o $out main.go
+          zip -j $zip $out
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ github.ref_name }}
+          files: dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_PAT }}

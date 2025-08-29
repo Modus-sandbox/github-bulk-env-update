@@ -1,0 +1,13 @@
+org: Modus-sandbox
+repos:
+  - name: sarath-test
+    environments:
+      dev:
+        API_KEY: "blah"      # read file contents
+        SIMPLE_SECRET: "plain-string-secret"     # literal string
+      prod:
+        DB_PASSWORD:
+          file: "db_password.txt"   # file (object form)
+        API_URL:
+          value: "https://api.example.com"       # explicit value form
+
