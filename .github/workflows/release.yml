@@ -16,12 +16,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.20'
+          go-version: '1.20.x'
+          cache: true
+
+      - name: Resolve modules
+        run: go mod tidy
 
       - name: Build binary
         env:
@@ -33,11 +37,15 @@ jobs:
           if [ "${{ matrix.goos }}" = "windows" ]; then
             ext=".exe"
           fi
-          name=gh-env-secrets-${{ matrix.goos }}-${{ matrix.goarch }}
-          out=dist/$name$ext
-          zip=dist/$name.zip
-          go build -o $out main.go
-          zip -j $zip $out
+          name="gh-env-secrets-${{ matrix.goos }}-${{ matrix.goarch }}"
+          out="dist/${name}${ext}"
+          zip="dist/${name}.zip"
+
+          # Build (pure Go sealed-box with x/crypto)
+          go build -o "${out}" ./main.go
+
+          # Package
+          zip -j "${zip}" "${out}"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v1

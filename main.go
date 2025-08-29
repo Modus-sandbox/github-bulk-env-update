@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,33 +16,32 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jamesruan/sodium"
+	"golang.org/x/crypto/nacl/box"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	apiBase    = "https://api.github.com"
-	userAgent  = "bulk-env-update/1.0"
-	httpTO     = 30 * time.Second
+	apiBase   = "https://api.github.com"
+	userAgent = "bulk-env-update/1.0"
+	httpTO    = 30 * time.Second
 )
 
-// ---------- YAML config ----------
-//
-// Example (config.yaml):
-//
-// org: my-org
-// repos:
-//   - name: sample-repo
-//     environments:
-//       dev:
-//         API_KEY: "@secrets/dev/api_key.txt"      # file-based (prefix with @)
-//         CONN_STRING:
-//           file: "secrets/dev/conn.txt"           # file-based (object form)
-//         SIMPLE_VALUE: "hello"                     # literal string
-//       prod:
-//         API_KEY: "@secrets/prod/api_key.txt"
-//
-// ---------------------------------
+/*
+YAML config example (config.yaml):
+
+org: my-org
+repos:
+  - name: sample-repo
+    environments:
+      dev:
+        API_KEY: "@secrets/dev/api_key.txt"      # file-based (@path)
+        SIMPLE_SECRET: "plain-string-secret"     # literal
+      prod:
+        DB_PASSWORD:
+          file: "secrets/prod/db_password.txt"   # file (object form)
+        API_URL:
+          value: "https://api.example.com"       # explicit value
+*/
 
 type Config struct {
 	Org   string    `yaml:"org"`
@@ -49,19 +49,18 @@ type Config struct {
 }
 
 type RepoCfg struct {
-	Name         string                                     `yaml:"name"`
-	Environments map[string]map[string]any                  `yaml:"environments"` // envName -> (secretName -> value | {file:..}|{value:..})
+	Name         string                       `yaml:"name"`
+	Environments map[string]map[string]any    `yaml:"environments"` // env -> (secret -> mixed value)
 }
 
-// Resolve secret value from the flexible YAML forms.
-// - "literal string" -> returns as-is
-// - "@path/to/file"  -> returns file contents
-// - {file: "..."}    -> returns file contents
-// - {value: "..."}   -> returns the value
+// Resolve secret value from YAML:
+// - "literal string" -> returned as-is
+// - "@path"          -> file contents
+// - {file: "path"}   -> file contents
+// - {value: "..."}   -> the value
 func resolveSecretValue(v any) (string, error) {
 	switch t := v.(type) {
 	case string:
-		// '@' prefix => file path
 		if strings.HasPrefix(t, "@") {
 			path := strings.TrimPrefix(t, "@")
 			b, err := os.ReadFile(path)
@@ -112,10 +111,10 @@ type repoResp struct {
 
 type envKeyResp struct {
 	KeyID string `json:"key_id"`
-	Key   string `json:"key"` // base64 public key (32 bytes when decoded)
+	Key   string `json:"key"` // base64 X25519 public key (32 bytes when decoded)
 }
 
-// ---------- HTTP helpers ----------
+// ---------- HTTP client ----------
 
 type ghClient struct {
 	http  *http.Client
@@ -124,7 +123,7 @@ type ghClient struct {
 
 func newGH(token string) *ghClient {
 	return &ghClient{
-		http: &http.Client{Timeout: httpTO},
+		http:  &http.Client{Timeout: httpTO},
 		token: token,
 	}
 }
@@ -166,10 +165,6 @@ func (c *ghClient) doJSON(ctx context.Context, method, url string, in any, out a
 	return nil
 }
 
-func (c *ghClient) doNoBody(ctx context.Context, method, url string) error {
-	return c.doJSON(ctx, method, url, nil, nil)
-}
-
 // ---------- GitHub operations ----------
 
 func (c *ghClient) getRepoID(ctx context.Context, owner, repo string) (int64, error) {
@@ -181,11 +176,10 @@ func (c *ghClient) getRepoID(ctx context.Context, owner, repo string) (int64, er
 	return out.ID, nil
 }
 
-// Create or update an environment (idempotent)
+// Create/update an environment (idempotent)
 func (c *ghClient) ensureEnvironment(ctx context.Context, owner, repo, envName string) error {
 	url := fmt.Sprintf("%s/repos/%s/%s/environments/%s", apiBase, owner, repo, envName)
-	// PUT with empty body is ok; you can pass optional properties if you need.
-	payload := map[string]any{}
+	payload := map[string]any{} // add env protection options here if needed
 	return c.doJSON(ctx, "PUT", url, payload, nil)
 }
 
@@ -205,28 +199,28 @@ func (c *ghClient) putEnvironmentSecret(ctx context.Context, repoID int64, envNa
 	return c.doJSON(ctx, "PUT", url, payload, nil)
 }
 
-// ---------- Encryption (libsodium sealed box) ----------
+// ---------- Encryption (pure Go: NaCl sealed box) ----------
 
+// encryptSecret uses NaCl sealed box (box.SealAnonymous), which is compatible
+// with libsodium's crypto_box_seal that GitHub uses.
 func encryptSecret(plaintext string, githubB64PublicKey string) (string, error) {
-	// Decode GitHub’s base64-encoded 32-byte public key
-	pubRaw, err := base64.StdEncoding.DecodeString(githubB64PublicKey)
+	pkRaw, err := base64.StdEncoding.DecodeString(githubB64PublicKey)
 	if err != nil {
 		return "", fmt.Errorf("decode public key: %w", err)
 	}
-	if len(pubRaw) != 32 {
-		return "", fmt.Errorf("unexpected public key length: %d (want 32)", len(pubRaw))
+	if len(pkRaw) != 32 {
+		return "", fmt.Errorf("unexpected public key length: %d (want 32)", len(pkRaw))
 	}
 
-	// Build sodium.BoxPublicKey (struct wrapping sodium.Bytes)
-	pk := sodium.BoxPublicKey{
-		Bytes: sodium.Bytes(pubRaw),
+	var pk [32]byte
+	copy(pk[:], pkRaw)
+
+	sealed, err := box.SealAnonymous(nil, []byte(plaintext), &pk, rand.Reader)
+	if err != nil {
+		return "", fmt.Errorf("seal anonymous: %w", err)
 	}
 
-	// Encrypt using sealed box
-	cipher := sodium.Bytes(plaintext).SealedBox(pk)
-
-	// Return base64 ciphertext for the API
-	return base64.StdEncoding.EncodeToString(cipher), nil
+	return base64.StdEncoding.EncodeToString(sealed), nil
 }
 
 // ---------- Main ----------
@@ -267,13 +261,12 @@ func main() {
 
 		log.Printf("==> Repo: %s/%s", cfg.Org, repoName)
 
-		// Resolve repo ID once
+		// Get repo ID once
 		repoID, err := gh.getRepoID(ctx, cfg.Org, repoName)
 		if err != nil {
 			log.Fatalf("get repo id %s/%s: %v", cfg.Org, repoName, err)
 		}
 
-		// Iterate environments
 		for envName, secrets := range r.Environments {
 			envName = strings.TrimSpace(envName)
 			if envName == "" {
@@ -282,18 +275,15 @@ func main() {
 			}
 			log.Printf("  -> Ensure environment: %s", envName)
 
-			// Ensure environment exists
 			if err := gh.ensureEnvironment(ctx, cfg.Org, repoName, envName); err != nil {
 				log.Fatalf("ensure environment %s: %v", envName, err)
 			}
 
-			// Get environment public key
 			key, err := gh.getEnvironmentPublicKey(ctx, repoID, envName)
 			if err != nil {
 				log.Fatalf("get env public key (%s): %v", envName, err)
 			}
 
-			// Upload each secret
 			for secretName, raw := range secrets {
 				secretName = strings.TrimSpace(secretName)
 				if secretName == "" {
@@ -306,7 +296,7 @@ func main() {
 					log.Fatalf("resolve secret %s/%s/%s: %v", repoName, envName, secretName, err)
 				}
 
-				// Normalize line endings & trim trailing newline from files
+				// Normalize endings & trim file trailing newline
 				plaintext = strings.TrimRight(plaintext, "\r\n")
 
 				encB64, err := encryptSecret(plaintext, key.Key)
@@ -325,7 +315,7 @@ func main() {
 	log.Println("All done.")
 }
 
-// ---------- Small utilities (nice errors) ----------
+// ---------- misc helpers ----------
 
 func fatalIfErr(where string, err error) {
 	if err != nil {
@@ -345,10 +335,8 @@ func mustAbs(p string) string {
 }
 
 func check(err error) {
-	if err != nil {
-		if !errors.Is(err, context.Canceled) {
-			log.Fatal(err)
-		}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatal(err)
 	}
 }
 

@@ -1,8 +1,10 @@
-module gh-env-secrets
+module bulk-env-update
 
-go 1.21
+go 1.20
 
 require (
-	github.com/jamesruan/sodium v1.0.14
+	golang.org/x/crypto v0.28.0
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+require golang.org/x/sys v0.26.0 // indirect
