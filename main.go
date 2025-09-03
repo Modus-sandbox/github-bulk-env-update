@@ -22,7 +22,7 @@ import (
 
 const (
 	apiBase   = "https://api.github.com"
-	userAgent = "bulk-env-update/1.5"
+	userAgent = "bulk-env-update/1.6"
 	httpTO    = 30 * time.Second
 )
 
@@ -32,6 +32,11 @@ Example config.yaml:
 org: my-org
 repos:
   - name: sample-repo
+    teams:
+      - slug: dev-team
+        permission: Write     # maps to "push"
+      - slug: qa-team
+        permission: Read      # maps to "pull"
     ruleset:
       name: "Master"
       enforcement: active
@@ -61,6 +66,7 @@ type RepoCfg struct {
 	Name         string                    `yaml:"name"`
 	Environments map[string]map[string]any `yaml:"environments"`
 	Ruleset      *RulesetCfg               `yaml:"ruleset,omitempty"`
+	Teams        []TeamPerm                `yaml:"teams,omitempty"`
 }
 
 type RulesetCfg struct {
@@ -72,6 +78,11 @@ type RulesetCfg struct {
 	BlockForcePushes    bool     `yaml:"block_force_pushes,omitempty"`
 	RestrictDeletions   bool     `yaml:"restrict_deletions,omitempty"`
 	RequireStatusChecks []string `yaml:"require_status_checks,omitempty"`
+}
+
+type TeamPerm struct {
+	Slug       string `yaml:"slug"`
+	Permission string `yaml:"permission"`
 }
 
 // ---------- Secret helpers ----------
@@ -256,7 +267,37 @@ func (c *ghClient) deleteRepoRuleset(ctx context.Context, owner, repo string, id
 	return c.doJSON(ctx, "DELETE", url, nil, nil)
 }
 
-// Build payload from our RulesetCfg
+// ---------- GitHub operations (teams) ----------
+
+// PUT /orgs/{org}/teams/{team_slug}/repos/{org}/{repo}
+func (c *ghClient) setTeamPermission(ctx context.Context, org, repo, team, perm string) error {
+	url := fmt.Sprintf("%s/orgs/%s/teams/%s/repos/%s/%s", apiBase, org, team, org, repo)
+	payload := map[string]any{
+		"permission": perm, // pull | triage | push | maintain | admin
+	}
+	return c.doJSON(ctx, "PUT", url, payload, nil)
+}
+
+// Normalize UI-style permissions to API values
+func normalizePermission(p string) (string, error) {
+	switch strings.ToLower(p) {
+	case "read", "pull":
+		return "pull", nil
+	case "triage":
+		return "triage", nil
+	case "write", "push":
+		return "push", nil
+	case "maintain":
+		return "maintain", nil
+	case "admin":
+		return "admin", nil
+	default:
+		return "", fmt.Errorf("invalid permission %q (valid: Read, Write, Admin, Triage, Maintain)", p)
+	}
+}
+
+// ---------- Ruleset payload ----------
+
 func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 	if cfg == nil {
 		return nil
@@ -315,7 +356,7 @@ func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 		"enforcement":   enforcement,
 		"conditions":    cond,
 		"rules":         rules,
-		"bypass_actors": []any{}, // extend if you need bypasses
+		"bypass_actors": []any{}, // add if you want bypasses
 	}
 }
 
@@ -426,7 +467,7 @@ func main() {
 			log.Fatalf("get repo id %s/%s: %v", cfg.Org, repoName, err)
 		}
 
-		// Step 1: ensure environments + secrets
+		// Step 1: environments + secrets
 		createdEnvs := map[string]bool{}
 		for envName, secrets := range r.Environments {
 			envName = strings.TrimSpace(envName)
@@ -486,6 +527,24 @@ func main() {
 			}
 			if err := gh.upsertRepoRuleset(ctx, cfg.Org, repoName, r.Ruleset); err != nil {
 				log.Fatalf("ruleset upsert for %s: %v", repoName, err)
+			}
+		}
+
+		// Step 3: team permissions
+		for _, tp := range r.Teams {
+			slug := strings.TrimSpace(tp.Slug)
+			rawPerm := strings.TrimSpace(tp.Permission)
+			if slug == "" || rawPerm == "" {
+				log.Printf("  - skip team with empty slug/permission")
+				continue
+			}
+			perm, err := normalizePermission(rawPerm)
+			if err != nil {
+				log.Fatalf("invalid team permission for team %q: %v", slug, err)
+			}
+			log.Printf("  -> Set team %q permission=%q", slug, perm)
+			if err := gh.setTeamPermission(ctx, cfg.Org, repoName, slug, perm); err != nil {
+				log.Fatalf("set team %s/%s perm %s: %v", cfg.Org, slug, perm, err)
 			}
 		}
 	}

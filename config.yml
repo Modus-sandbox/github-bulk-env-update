@@ -27,3 +27,10 @@ repos:
           file: "db_password.txt"
         API_URL:
           value: "https://api.example.com"
+    teams:
+      - slug: gth_dhb_admin
+        permission: Admin     # maps to "push"
+      - slug: gth_dhb_maintain
+        permission: Read      # maps to "pull"
+      - slug: gth_dhb_user
+        permission: Maintain
