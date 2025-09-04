@@ -101,18 +101,17 @@ type RulesetCfg struct {
 	RestrictDeletions   bool     `yaml:"restrict_deletions,omitempty"`
 	RequireStatusChecks []string `yaml:"require_status_checks,omitempty"`
 
-	// NEW: optional parameters for the "pull_request" rule
+	// optional parameters for the "pull_request" rule
 	PullRequestOptions *PullRequestOptions `yaml:"pull_request_options,omitempty"`
 }
 
-// NEW: shape for pull_request_options
 type PullRequestOptions struct {
 	RequiredApprovingReviewCount  int      `yaml:"required_approving_review_count,omitempty"`
 	DismissStaleReviews           bool     `yaml:"dismiss_stale_reviews,omitempty"`
 	RequireCodeOwnerReview        bool     `yaml:"require_code_owner_review,omitempty"`
 	RequireLastPushApproval       bool     `yaml:"require_last_push_approval,omitempty"`
 	RequireConversationResolution bool     `yaml:"require_conversation_resolution,omitempty"`
-	AllowedMergeMethods           []string `yaml:"allowed_merge_methods,omitempty"` // ["merge","squash","rebase"]
+	AllowedMergeMethods           []string `yaml:"allowed_merge_methods,omitempty"` // ["merge","squash","rebase"] (not used in rulesets)
 }
 
 type TeamPerm struct {
@@ -203,12 +202,8 @@ type rulesetListItem struct {
 	SourceType string `json:"source_type"`
 }
 
-type teamResp struct {
-	ID int64 `json:"id"`
-}
-type userResp struct {
-	ID int64 `json:"id"`
-}
+type teamResp struct{ ID int64 `json:"id"` }
+type userResp struct{ ID int64 `json:"id"` }
 
 // For env branch/tag policies
 type envPolicy struct {
@@ -758,6 +753,24 @@ func main() {
 			log.Fatalf("get repo id %s/%s: %v", cfg.Org, repoName, err)
 		}
 
+		// STEP 0: team permissions FIRST
+		for _, tp := range r.Teams {
+			slug := strings.TrimSpace(tp.Slug)
+			rawPerm := strings.TrimSpace(tp.Permission)
+			if slug == "" || rawPerm == "" {
+				log.Printf("  - skip team with empty slug/permission")
+				continue
+			}
+			perm, err := normalizePermission(rawPerm)
+			if err != nil {
+				log.Fatalf("invalid team permission for team %q: %v", slug, err)
+			}
+			log.Printf("  -> Set team %q permission=%q", slug, perm)
+			if err := gh.setTeamPermission(ctx, cfg.Org, repoName, slug, perm); err != nil {
+				log.Fatalf("set team %s/%s perm %s: %v", cfg.Org, slug, perm, err)
+			}
+		}
+
 		// Step 1: environments + protection + secrets
 		createdEnvs := map[string]bool{}
 		for envName, entries := range r.Environments {
@@ -845,24 +858,6 @@ func main() {
 				log.Fatalf("ruleset upsert for %s: %v", repoName, err)
 			}
 		}
-
-		// Step 3: team permissions
-		for _, tp := range r.Teams {
-			slug := strings.TrimSpace(tp.Slug)
-			rawPerm := strings.TrimSpace(tp.Permission)
-			if slug == "" || rawPerm == "" {
-				log.Printf("  - skip team with empty slug/permission")
-				continue
-			}
-			perm, err := normalizePermission(rawPerm)
-			if err != nil {
-				log.Fatalf("invalid team permission for team %q: %v", slug, err)
-			}
-			log.Printf("  -> Set team %q permission=%q", slug, perm)
-			if err := gh.setTeamPermission(ctx, cfg.Org, repoName, slug, perm); err != nil {
-				log.Fatalf("set team %s/%s perm %s: %v", cfg.Org, slug, perm, err)
-			}
-		}
 	}
 
 	log.Println("All done.")
@@ -886,3 +881,4 @@ func check(err error) {
 		log.Fatal(err)
 	}
 }
+

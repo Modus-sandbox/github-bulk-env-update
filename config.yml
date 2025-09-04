@@ -10,6 +10,7 @@ repos:
       # Rules you want applied (only those present are sent)
       require_deployments:         # "Require deployments to succeed"
         - "prod"
+        - "dev"
       require_pull_request: true   # "Require a pull request before merging"
       pull_request_options:
         required_approving_review_count: 1
