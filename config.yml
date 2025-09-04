@@ -53,4 +53,5 @@ repos:
       - slug: gth_dhb_maintain
         permission: Read      # maps to "pull"
       - slug: gth_dhb_user
-        permission: Maintain
+        permission: Maintain #valid: Read, Write, Admin, Triage, Maintain
+
