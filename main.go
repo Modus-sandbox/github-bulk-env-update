@@ -43,6 +43,13 @@ repos:
       target_branches: ["~DEFAULT_BRANCH"]
       require_deployments: ["prod"]
       require_pull_request: true
+      pull_request_options:
+        required_approving_review_count: 1
+        dismiss_stale_reviews: true
+        require_code_owner_review: true
+        require_last_push_approval: true
+        require_conversation_resolution: true
+        #allowed_merge_methods: ["merge","squash","rebase"]
       block_force_pushes: true
       restrict_deletions: true
       # require_status_checks: ["build","test"]
@@ -93,6 +100,19 @@ type RulesetCfg struct {
 	BlockForcePushes    bool     `yaml:"block_force_pushes,omitempty"`
 	RestrictDeletions   bool     `yaml:"restrict_deletions,omitempty"`
 	RequireStatusChecks []string `yaml:"require_status_checks,omitempty"`
+
+	// NEW: optional parameters for the "pull_request" rule
+	PullRequestOptions *PullRequestOptions `yaml:"pull_request_options,omitempty"`
+}
+
+// NEW: shape for pull_request_options
+type PullRequestOptions struct {
+	RequiredApprovingReviewCount  int      `yaml:"required_approving_review_count,omitempty"`
+	DismissStaleReviews           bool     `yaml:"dismiss_stale_reviews,omitempty"`
+	RequireCodeOwnerReview        bool     `yaml:"require_code_owner_review,omitempty"`
+	RequireLastPushApproval       bool     `yaml:"require_last_push_approval,omitempty"`
+	RequireConversationResolution bool     `yaml:"require_conversation_resolution,omitempty"`
+	AllowedMergeMethods           []string `yaml:"allowed_merge_methods,omitempty"` // ["merge","squash","rebase"]
 }
 
 type TeamPerm struct {
@@ -183,8 +203,12 @@ type rulesetListItem struct {
 	SourceType string `json:"source_type"`
 }
 
-type teamResp struct{ ID int64 `json:"id"` }
-type userResp struct{ ID int64 `json:"id"` }
+type teamResp struct {
+	ID int64 `json:"id"`
+}
+type userResp struct {
+	ID int64 `json:"id"`
+}
 
 // For env branch/tag policies
 type envPolicy struct {
@@ -563,7 +587,35 @@ func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 		rules = append(rules, map[string]any{"type": "non_fast_forward"})
 	}
 	if cfg.RequirePullRequest {
-		rules = append(rules, map[string]any{"type": "pull_request"})
+		// include parameters from pull_request_options when provided
+		pr := map[string]any{"type": "pull_request"}
+		if cfg.PullRequestOptions != nil {
+			params := map[string]any{}
+			o := cfg.PullRequestOptions
+			if o.RequiredApprovingReviewCount > 0 {
+				params["required_approving_review_count"] = o.RequiredApprovingReviewCount
+			}
+			// API expects dismiss_stale_reviews_on_push
+			if o.DismissStaleReviews {
+				params["dismiss_stale_reviews_on_push"] = true
+			}
+			if o.RequireCodeOwnerReview {
+				params["require_code_owner_review"] = true
+			}
+			if o.RequireLastPushApproval {
+				params["require_last_push_approval"] = true
+			}
+			// API expects required_review_thread_resolution
+			if o.RequireConversationResolution {
+				params["required_review_thread_resolution"] = true
+			}
+
+			// DO NOT send allowed_merge_methods here: not a ruleset parameter
+			if len(params) > 0 {
+				pr["parameters"] = params
+			}
+		}
+		rules = append(rules, pr)
 	}
 	if len(cfg.RequireDeployments) > 0 {
 		rules = append(rules, map[string]any{
@@ -577,7 +629,7 @@ func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 		rules = append(rules, map[string]any{
 			"type": "required_status_checks",
 			"parameters": map[string]any{
-				"required_checks":                     mapStatusChecks(cfg.RequireStatusChecks),
+				"required_checks":                      mapStatusChecks(cfg.RequireStatusChecks),
 				"strict_required_status_checks_policy": false,
 				"do_not_enforce_on_create":             false,
 			},
@@ -834,4 +886,3 @@ func check(err error) {
 		log.Fatal(err)
 	}
 }
-
