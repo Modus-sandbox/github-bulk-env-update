@@ -22,7 +22,7 @@ import (
 
 const (
 	apiBase   = "https://api.github.com"
-	userAgent = "bulk-env-update/1.6"
+	userAgent = "bulk-env-update/2.0.3"
 	httpTO    = 30 * time.Second
 )
 
@@ -34,23 +34,38 @@ repos:
   - name: sample-repo
     teams:
       - slug: dev-team
-        permission: Write     # maps to "push"
+        permission: Write
       - slug: qa-team
-        permission: Read      # maps to "pull"
+        permission: Read
     ruleset:
       name: "Master"
       enforcement: active
       target_branches: ["~DEFAULT_BRANCH"]
-      require_deployments: ["prd"]
+      require_deployments: ["prod"]
       require_pull_request: true
       block_force_pushes: true
       restrict_deletions: true
-      require_status_checks: ["build", "test"]
+      # require_status_checks: ["build","test"]
     environments:
       dev:
         API_KEY: "@secrets/dev/api_key.txt"
         SIMPLE_SECRET: "plain-string-secret"
       prod:
+        protection:
+          reviewers:
+            teams: ["ops-team"]
+            users: ["alice"]
+          prevent_self_review: true
+          wait_timer: 0
+          allow_admins_bypass: true
+          # Allow all branches:
+          # deployment_branch_policy: null
+          # Or enable "Selected branches and tags":
+          deployment_branch_policy:
+            protected_branches: false
+            custom_branch_policies: true
+            branches: ["main", "release-*"]
+            tags: ["v*"]
         DB_PASSWORD:
           file: "secrets/prod/db_password.txt"
         API_URL:
@@ -71,7 +86,7 @@ type RepoCfg struct {
 
 type RulesetCfg struct {
 	Name                string   `yaml:"name"`
-	Enforcement         string   `yaml:"enforcement"` // active|disabled (default active)
+	Enforcement         string   `yaml:"enforcement"`
 	TargetBranches      []string `yaml:"target_branches"`
 	RequireDeployments  []string `yaml:"require_deployments,omitempty"`
 	RequirePullRequest  bool     `yaml:"require_pull_request,omitempty"`
@@ -83,6 +98,25 @@ type RulesetCfg struct {
 type TeamPerm struct {
 	Slug       string `yaml:"slug"`
 	Permission string `yaml:"permission"`
+}
+
+// ---- Optional environment protection (parsed from env map under key "protection")
+
+type EnvProtection struct {
+	Reviewers struct {
+		Teams []string `yaml:"teams"` // team slugs
+		Users []string `yaml:"users"` // usernames
+	} `yaml:"reviewers"`
+	PreventSelfReview *bool `yaml:"prevent_self_review,omitempty"`
+	WaitTimer         *int  `yaml:"wait_timer,omitempty"`          // seconds
+	AllowAdminsBypass *bool `yaml:"allow_admins_bypass,omitempty"` // maps to can_admins_bypass
+
+	DeploymentBranchPolicy *struct {
+		ProtectedBranches    *bool    `yaml:"protected_branches,omitempty"`
+		CustomBranchPolicies *bool    `yaml:"custom_branch_policies,omitempty"`
+		Branches             []string `yaml:"branches,omitempty"` // desired branch patterns
+		Tags                 []string `yaml:"tags,omitempty"`     // desired tag patterns
+	} `yaml:"deployment_branch_policy,omitempty"`
 }
 
 // ---------- Secret helpers ----------
@@ -146,7 +180,18 @@ type envKeyResp struct {
 type rulesetListItem struct {
 	ID         int64  `json:"id"`
 	Name       string `json:"name"`
-	SourceType string `json:"source_type"` // "Repository" or "Organization"
+	SourceType string `json:"source_type"`
+}
+
+type teamResp struct{ ID int64 `json:"id"` }
+type userResp struct{ ID int64 `json:"id"` }
+
+// For env branch/tag policies
+type envPolicy struct {
+	ID      int64  `json:"id"`
+	Type    string `json:"type"`    // "branch" or "tag"
+	Pattern string `json:"pattern"` // some responses use "name" instead
+	Name    string `json:"name"`
 }
 
 // ---------- HTTP client ----------
@@ -234,16 +279,223 @@ func (c *ghClient) putEnvironmentSecret(ctx context.Context, repoID int64, envNa
 	return c.doJSON(ctx, "PUT", url, payload, nil)
 }
 
+// --- Environment protection (reviewers, wait timer, prevent self-review, admins bypass, deployment_branch_policy)
+
+func (c *ghClient) getTeamID(ctx context.Context, org, slug string) (int64, error) {
+	var out teamResp
+	url := fmt.Sprintf("%s/orgs/%s/teams/%s", apiBase, org, slug)
+	if err := c.doJSON(ctx, "GET", url, nil, &out); err != nil {
+		return 0, err
+	}
+	return out.ID, nil
+}
+
+func (c *ghClient) getUserID(ctx context.Context, username string) (int64, error) {
+	var out userResp
+	url := fmt.Sprintf("%s/users/%s", apiBase, username)
+	if err := c.doJSON(ctx, "GET", url, nil, &out); err != nil {
+		return 0, err
+	}
+	return out.ID, nil
+}
+
+// Robust list: accept either a bare array OR a wrapper object {branch_policies:[...]} (optionally {policies:[...]})
+func (c *ghClient) listEnvPolicies(ctx context.Context, owner, repo, env string) ([]envPolicy, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/environments/%s/deployment-branch-policies", apiBase, owner, repo, env)
+
+	// Try array first
+	var arr []envPolicy
+	if err := c.doJSON(ctx, "GET", url, nil, &arr); err == nil {
+		// normalize Pattern if missing
+		for i := range arr {
+			if arr[i].Pattern == "" {
+				arr[i].Pattern = arr[i].Name
+			}
+		}
+		return arr, nil
+	}
+
+	// Fallback: wrapper object
+	var obj struct {
+		TotalCount     int         `json:"total_count"`
+		BranchPolicies []envPolicy `json:"branch_policies"`
+		Policies       []envPolicy `json:"policies"`
+	}
+	if err := c.doJSON(ctx, "GET", url, nil, &obj); err != nil {
+		return nil, err
+	}
+	var list []envPolicy
+	if len(obj.BranchPolicies) > 0 {
+		list = obj.BranchPolicies
+	} else {
+		list = obj.Policies
+	}
+	for i := range list {
+		if list[i].Pattern == "" {
+			list[i].Pattern = list[i].Name
+		}
+	}
+	return list, nil
+}
+
+func (c *ghClient) createEnvPolicy(ctx context.Context, owner, repo, env, ptype, name string) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/environments/%s/deployment-branch-policies", apiBase, owner, repo, env)
+	// per API: only "type" and "name" are accepted
+	payload := map[string]any{"type": ptype, "name": name}
+	return c.doJSON(ctx, "POST", url, payload, nil)
+}
+
+func (c *ghClient) deleteEnvPolicy(ctx context.Context, owner, repo, env string, id int64) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/environments/%s/deployment-branch-policies/%d", apiBase, owner, repo, env, id)
+	return c.doJSON(ctx, "DELETE", url, nil, nil)
+}
+
+// The main updater: PUT base protection, then reconcile custom branch/tag lists
+func (c *ghClient) updateEnvironmentProtection(ctx context.Context, owner, repo, env string, prot EnvProtection, dbpExplicitNull bool) error {
+	// reviewers -> [{type:"Team"|"User", id:int}]
+	var reviewers []map[string]any
+	for _, tslug := range prot.Reviewers.Teams {
+		id, err := c.getTeamID(ctx, owner, tslug)
+		if err != nil {
+			return fmt.Errorf("resolve team %q: %w", tslug, err)
+		}
+		reviewers = append(reviewers, map[string]any{"type": "Team", "id": id})
+	}
+	for _, uname := range prot.Reviewers.Users {
+		id, err := c.getUserID(ctx, uname)
+		if err != nil {
+			return fmt.Errorf("resolve user %q: %w", uname, err)
+		}
+		reviewers = append(reviewers, map[string]any{"type": "User", "id": id})
+	}
+
+	payload := map[string]any{"reviewers": reviewers}
+
+	if prot.PreventSelfReview != nil {
+		payload["prevent_self_review"] = *prot.PreventSelfReview
+	}
+	if prot.WaitTimer != nil {
+		payload["wait_timer"] = *prot.WaitTimer
+	}
+	if prot.AllowAdminsBypass != nil {
+		payload["can_admins_bypass"] = *prot.AllowAdminsBypass
+	}
+
+	if dbpExplicitNull {
+		payload["deployment_branch_policy"] = nil
+	} else if prot.DeploymentBranchPolicy != nil {
+		dbp := map[string]any{}
+		if prot.DeploymentBranchPolicy.ProtectedBranches != nil {
+			dbp["protected_branches"] = *prot.DeploymentBranchPolicy.ProtectedBranches
+		}
+		if prot.DeploymentBranchPolicy.CustomBranchPolicies != nil {
+			dbp["custom_branch_policies"] = *prot.DeploymentBranchPolicy.CustomBranchPolicies
+		}
+		if len(dbp) > 0 {
+			payload["deployment_branch_policy"] = dbp
+		}
+	}
+
+	// Show exactly what we send (useful and tidy)
+	if jb, err := json.Marshal(payload); err == nil {
+		log.Printf("    • PUT env payload: %s", string(jb))
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/%s/environments/%s", apiBase, owner, repo, env)
+	if err := c.doJSON(ctx, "PUT", url, payload, nil); err != nil {
+		return err
+	}
+
+	// If custom_branch_policies is enabled, reconcile the explicit lists
+	if prot.DeploymentBranchPolicy != nil &&
+		prot.DeploymentBranchPolicy.CustomBranchPolicies != nil &&
+		*prot.DeploymentBranchPolicy.CustomBranchPolicies {
+
+		wantBranches := map[string]struct{}{}
+		for _, b := range prot.DeploymentBranchPolicy.Branches {
+			b = strings.TrimSpace(b)
+			if b != "" {
+				wantBranches[b] = struct{}{}
+			}
+		}
+		wantTags := map[string]struct{}{}
+		for _, t := range prot.DeploymentBranchPolicy.Tags {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				wantTags[t] = struct{}{}
+			}
+		}
+
+		if len(wantBranches) > 0 || len(wantTags) > 0 {
+			existing, err := c.listEnvPolicies(ctx, owner, repo, env)
+			if err != nil {
+				return fmt.Errorf("list env policies: %w", err)
+			}
+			type key struct{ T, P string }
+			have := map[key]int64{}
+			for _, p := range existing {
+				pat := p.Pattern
+				if pat == "" && p.Name != "" {
+					pat = p.Name
+				}
+				have[key{strings.ToLower(p.Type), pat}] = p.ID
+			}
+
+			// Create missing branches
+			for b := range wantBranches {
+				k := key{"branch", b}
+				if _, ok := have[k]; !ok {
+					if err := c.createEnvPolicy(ctx, owner, repo, env, "branch", b); err != nil {
+						return fmt.Errorf("create env branch policy %q: %w", b, err)
+					}
+					log.Printf("    • added branch policy: %s", b)
+				}
+			}
+			// Create missing tags
+			for t := range wantTags {
+				k := key{"tag", t}
+				if _, ok := have[k]; !ok {
+					if err := c.createEnvPolicy(ctx, owner, repo, env, "tag", t); err != nil {
+						return fmt.Errorf("create env tag policy %q: %w", t, err)
+					}
+					log.Printf("    • added tag policy: %s", t)
+				}
+			}
+
+			// Delete extraneous policies (only if a list was supplied for that type)
+			for k, id := range have {
+				if k.T == "branch" && len(wantBranches) > 0 {
+					if _, keep := wantBranches[k.P]; !keep {
+						if err := c.deleteEnvPolicy(ctx, owner, repo, env, id); err != nil {
+							return fmt.Errorf("delete env branch policy %q: %w", k.P, err)
+						}
+						log.Printf("    • removed branch policy: %s", k.P)
+					}
+				}
+				if k.T == "tag" && len(wantTags) > 0 {
+					if _, keep := wantTags[k.P]; !keep {
+						if err := c.deleteEnvPolicy(ctx, owner, repo, env, id); err != nil {
+							return fmt.Errorf("delete env tag policy %q: %w", k.P, err)
+						}
+						log.Printf("    • removed tag policy: %s", k.P)
+					}
+				}
+			}
+		}
+	}
+
+	// Clean output: no post-GET debug spam
+	return nil
+}
+
 // ---------- GitHub operations (rulesets) ----------
 
 func (c *ghClient) listRepoRulesets(ctx context.Context, owner, repo string) ([]rulesetListItem, error) {
 	var out []rulesetListItem
-	// Exclude org/parent rulesets; restrict to branch target
 	url := fmt.Sprintf("%s/repos/%s/%s/rulesets?includes_parents=false&targets=branch", apiBase, owner, repo)
 	if err := c.doJSON(ctx, "GET", url, nil, &out); err != nil {
 		return nil, err
 	}
-	// Extra safety: keep only repo-scoped items
 	filtered := out[:0]
 	for _, r := range out {
 		if strings.EqualFold(r.SourceType, "Repository") {
@@ -269,16 +521,12 @@ func (c *ghClient) deleteRepoRuleset(ctx context.Context, owner, repo string, id
 
 // ---------- GitHub operations (teams) ----------
 
-// PUT /orgs/{org}/teams/{team_slug}/repos/{org}/{repo}
 func (c *ghClient) setTeamPermission(ctx context.Context, org, repo, team, perm string) error {
 	url := fmt.Sprintf("%s/orgs/%s/teams/%s/repos/%s/%s", apiBase, org, team, org, repo)
-	payload := map[string]any{
-		"permission": perm, // pull | triage | push | maintain | admin
-	}
+	payload := map[string]any{"permission": perm} // pull | triage | push | maintain | admin
 	return c.doJSON(ctx, "PUT", url, payload, nil)
 }
 
-// Normalize UI-style permissions to API values
 func normalizePermission(p string) (string, error) {
 	switch strings.ToLower(p) {
 	case "read", "pull":
@@ -308,20 +556,15 @@ func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 	}
 
 	var rules []map[string]any
-
-	// UI: Restrict deletions
 	if cfg.RestrictDeletions {
 		rules = append(rules, map[string]any{"type": "deletion"})
 	}
-	// UI: Block force pushes
 	if cfg.BlockForcePushes {
 		rules = append(rules, map[string]any{"type": "non_fast_forward"})
 	}
-	// UI: Require a pull request before merging
 	if cfg.RequirePullRequest {
 		rules = append(rules, map[string]any{"type": "pull_request"})
 	}
-	// UI: Require deployments to succeed
 	if len(cfg.RequireDeployments) > 0 {
 		rules = append(rules, map[string]any{
 			"type": "required_deployments",
@@ -330,7 +573,6 @@ func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 			},
 		})
 	}
-	// UI: Require status checks (simple translation from list of contexts)
 	if len(cfg.RequireStatusChecks) > 0 {
 		rules = append(rules, map[string]any{
 			"type": "required_status_checks",
@@ -356,17 +598,14 @@ func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 		"enforcement":   enforcement,
 		"conditions":    cond,
 		"rules":         rules,
-		"bypass_actors": []any{}, // add if you want bypasses
+		"bypass_actors": []any{},
 	}
 }
 
 func mapStatusChecks(ctxs []string) []map[string]any {
 	out := make([]map[string]any, 0, len(ctxs))
 	for _, c := range ctxs {
-		out = append(out, map[string]any{
-			"context":        c,
-			"integration_id": nil, // set if tied to a GitHub App
-		})
+		out = append(out, map[string]any{"context": c, "integration_id": nil})
 	}
 	return out
 }
@@ -467,9 +706,9 @@ func main() {
 			log.Fatalf("get repo id %s/%s: %v", cfg.Org, repoName, err)
 		}
 
-		// Step 1: environments + secrets
+		// Step 1: environments + protection + secrets
 		createdEnvs := map[string]bool{}
-		for envName, secrets := range r.Environments {
+		for envName, entries := range r.Environments {
 			envName = strings.TrimSpace(envName)
 			if envName == "" {
 				log.Println("  - skip environment with empty name")
@@ -481,24 +720,50 @@ func main() {
 			}
 			createdEnvs[envName] = true
 
+			// Detect explicit null for deployment_branch_policy
+			dbpExplicitNull := false
+			if protRaw, ok := entries["protection"]; ok {
+				if mp, ok2 := protRaw.(map[string]any); ok2 {
+					if _, exists := mp["deployment_branch_policy"]; exists && mp["deployment_branch_policy"] == nil {
+						dbpExplicitNull = true
+					}
+				}
+
+				// Convert map[any]any -> EnvProtection via YAML round-trip (keeps bools)
+				var prot EnvProtection
+				yb, err := yaml.Marshal(protRaw)
+				if err != nil {
+					log.Fatalf("marshal env protection yaml for %s/%s: %v", repoName, envName, err)
+				}
+				if err := yaml.Unmarshal(yb, &prot); err != nil {
+					log.Fatalf("parse environment protection for %s/%s: %v", repoName, envName, err)
+				}
+
+				if err := gh.updateEnvironmentProtection(ctx, cfg.Org, repoName, envName, prot, dbpExplicitNull); err != nil {
+					log.Fatalf("update env protection for %s/%s: %v", repoName, envName, err)
+				}
+				log.Printf("    ✓ protection updated")
+			}
+
+			// Secrets (all non-protection keys)
 			key, err := gh.getEnvironmentPublicKey(ctx, repoID, envName)
 			if err != nil {
 				log.Fatalf("get env public key (%s): %v", envName, err)
 			}
-
-			for secretName, raw := range secrets {
-				secretName = strings.TrimSpace(secretName)
+			for k, raw := range entries {
+				if k == "protection" {
+					continue
+				}
+				secretName := strings.TrimSpace(k)
 				if secretName == "" {
 					log.Println("    - skip secret with empty name")
 					continue
 				}
-
 				plaintext, err := resolveSecretValue(raw)
 				if err != nil {
 					log.Fatalf("resolve secret %s/%s/%s: %v", repoName, envName, secretName, err)
 				}
 				plaintext = strings.TrimRight(plaintext, "\r\n")
-
 				encB64, err := encryptSecret(plaintext, key.Key)
 				if err != nil {
 					log.Fatalf("encrypt secret %s/%s/%s: %v", repoName, envName, secretName, err)
@@ -515,7 +780,6 @@ func main() {
 			if len(r.Ruleset.TargetBranches) == 0 {
 				r.Ruleset.TargetBranches = []string{"~DEFAULT_BRANCH"}
 			}
-			// sanity-check required deployments
 			missing := []string{}
 			for _, e := range r.Ruleset.RequireDeployments {
 				if !createdEnvs[e] {
