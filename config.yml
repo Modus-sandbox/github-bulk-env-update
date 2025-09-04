@@ -55,4 +55,8 @@ repos:
         permission: Read      # maps to "pull"
       - slug: gth_dhb_user
         permission: Maintain #valid: Read, Write, Admin, Triage, Maintain
-
+    repo_secrets:
+      BLAH:
+        value: "blah"
+      SECRET_FROM_FILE:
+        file: test.txt

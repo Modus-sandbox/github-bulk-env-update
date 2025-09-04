@@ -37,6 +37,15 @@ repos:
         permission: Write
       - slug: qa-team
         permission: Read
+
+    # NEW: optional repository-level secrets (Actions -> Secrets and variables -> Secrets -> Repository secrets)
+    repo_secrets:
+      GLOBAL_TOKEN: "@secrets/global_token.txt"
+      SIMPLE_FLAG:
+        value: "enabled"
+      OTHER_SECRET:
+        file: "secrets/other_secret.txt"
+
     ruleset:
       name: "Master"
       enforcement: active
@@ -53,6 +62,7 @@ repos:
       block_force_pushes: true
       restrict_deletions: true
       # require_status_checks: ["build","test"]
+
     environments:
       dev:
         API_KEY: "@secrets/dev/api_key.txt"
@@ -89,6 +99,7 @@ type RepoCfg struct {
 	Environments map[string]map[string]any `yaml:"environments"`
 	Ruleset      *RulesetCfg               `yaml:"ruleset,omitempty"`
 	Teams        []TeamPerm                `yaml:"teams,omitempty"`
+	RepoSecrets  map[string]any            `yaml:"repo_secrets,omitempty"` // NEW
 }
 
 type RulesetCfg struct {
@@ -291,6 +302,26 @@ func (c *ghClient) getEnvironmentPublicKey(ctx context.Context, repoID int64, en
 
 func (c *ghClient) putEnvironmentSecret(ctx context.Context, repoID int64, envName, secretName, encryptedB64, keyID string) error {
 	url := fmt.Sprintf("%s/repositories/%d/environments/%s/secrets/%s", apiBase, repoID, envName, secretName)
+	payload := map[string]any{
+		"encrypted_value": encryptedB64,
+		"key_id":          keyID,
+	}
+	return c.doJSON(ctx, "PUT", url, payload, nil)
+}
+
+// --- NEW: Repository secrets (Actions)
+// GET repo public key:  GET /repos/{owner}/{repo}/actions/secrets/public-key
+// PUT repo secret:      PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}
+
+func (c *ghClient) getRepoActionsPublicKey(ctx context.Context, owner, repo string) (envKeyResp, error) {
+	var out envKeyResp
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/secrets/public-key", apiBase, owner, repo)
+	err := c.doJSON(ctx, "GET", url, nil, &out)
+	return out, err
+}
+
+func (c *ghClient) putRepoSecret(ctx context.Context, owner, repo, secretName, encryptedB64, keyID string) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/secrets/%s", apiBase, owner, repo, secretName)
 	payload := map[string]any{
 		"encrypted_value": encryptedB64,
 		"key_id":          keyID,
@@ -768,6 +799,35 @@ func main() {
 			log.Printf("  -> Set team %q permission=%q", slug, perm)
 			if err := gh.setTeamPermission(ctx, cfg.Org, repoName, slug, perm); err != nil {
 				log.Fatalf("set team %s/%s perm %s: %v", cfg.Org, slug, perm, err)
+			}
+		}
+
+		// STEP 0.5: Repository secrets (optional)
+		if len(r.RepoSecrets) > 0 {
+			log.Printf("  -> Ensure repository secrets")
+			repoKey, err := gh.getRepoActionsPublicKey(ctx, cfg.Org, repoName)
+			if err != nil {
+				log.Fatalf("get repo public key: %v")
+			}
+			for name, raw := range r.RepoSecrets {
+				secretName := strings.TrimSpace(name)
+				if secretName == "" {
+					log.Println("    - skip repo secret with empty name")
+					continue
+				}
+				plaintext, err := resolveSecretValue(raw)
+				if err != nil {
+					log.Fatalf("resolve repo secret %s/%s: %v", repoName, secretName, err)
+				}
+				plaintext = strings.TrimRight(plaintext, "\r\n")
+				encB64, err := encryptSecret(plaintext, repoKey.Key)
+				if err != nil {
+					log.Fatalf("encrypt repo secret %s/%s: %v", repoName, secretName, err)
+				}
+				if err := gh.putRepoSecret(ctx, cfg.Org, repoName, secretName, encB64, repoKey.KeyID); err != nil {
+					log.Fatalf("put repo secret %s/%s: %v", repoName, secretName, err)
+				}
+				log.Printf("    ✓ %s", secretName)
 			}
 		}
 
