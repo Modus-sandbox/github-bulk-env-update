@@ -213,8 +213,12 @@ type rulesetListItem struct {
 	SourceType string `json:"source_type"`
 }
 
-type teamResp struct{ ID int64 `json:"id"` }
-type userResp struct{ ID int64 `json:"id"` }
+type teamResp struct {
+	ID int64 `json:"id"`
+}
+type userResp struct {
+	ID int64 `json:"id"`
+}
 
 // For env branch/tag policies
 type envPolicy struct {
@@ -613,34 +617,26 @@ func rulesetPayloadFromCfg(cfg *RulesetCfg) map[string]any {
 		rules = append(rules, map[string]any{"type": "non_fast_forward"})
 	}
 	if cfg.RequirePullRequest {
-		// include parameters from pull_request_options when provided
 		pr := map[string]any{"type": "pull_request"}
-		if cfg.PullRequestOptions != nil {
-			params := map[string]any{}
-			o := cfg.PullRequestOptions
-			if o.RequiredApprovingReviewCount > 0 {
-				params["required_approving_review_count"] = o.RequiredApprovingReviewCount
-			}
-			// API expects dismiss_stale_reviews_on_push
-			if o.DismissStaleReviews {
-				params["dismiss_stale_reviews_on_push"] = true
-			}
-			if o.RequireCodeOwnerReview {
-				params["require_code_owner_review"] = true
-			}
-			if o.RequireLastPushApproval {
-				params["require_last_push_approval"] = true
-			}
-			// API expects required_review_thread_resolution
-			if o.RequireConversationResolution {
-				params["required_review_thread_resolution"] = true
-			}
 
-			// DO NOT send allowed_merge_methods here: not a ruleset parameter
-			if len(params) > 0 {
-				pr["parameters"] = params
-			}
+		// Always send a complete parameters object
+		params := map[string]any{
+			"require_code_owner_review":         false,
+			"require_last_push_approval":        false,
+			"dismiss_stale_reviews_on_push":     false,
+			"required_approving_review_count":   0,
+			"required_review_thread_resolution": false,
 		}
+
+		if o := cfg.PullRequestOptions; o != nil {
+			params["require_code_owner_review"] = o.RequireCodeOwnerReview
+			params["require_last_push_approval"] = o.RequireLastPushApproval
+			params["dismiss_stale_reviews_on_push"] = o.DismissStaleReviews
+			params["required_approving_review_count"] = o.RequiredApprovingReviewCount
+			params["required_review_thread_resolution"] = o.RequireConversationResolution
+		}
+
+		pr["parameters"] = params
 		rules = append(rules, pr)
 	}
 	if len(cfg.RequireDeployments) > 0 {
@@ -941,4 +937,3 @@ func check(err error) {
 		log.Fatal(err)
 	}
 }
-
