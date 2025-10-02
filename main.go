@@ -815,7 +815,6 @@ func main() {
 				if err != nil {
 					log.Fatalf("resolve repo secret %s/%s: %v", repoName, secretName, err)
 				}
-				plaintext = strings.TrimRight(plaintext, "\r\n")
 				encB64, err := encryptSecret(plaintext, repoKey.Key)
 				if err != nil {
 					log.Fatalf("encrypt repo secret %s/%s: %v", repoName, secretName, err)
@@ -884,7 +883,6 @@ func main() {
 				if err != nil {
 					log.Fatalf("resolve secret %s/%s/%s: %v", repoName, envName, secretName, err)
 				}
-				plaintext = strings.TrimRight(plaintext, "\r\n")
 				encB64, err := encryptSecret(plaintext, key.Key)
 				if err != nil {
 					log.Fatalf("encrypt secret %s/%s/%s: %v", repoName, envName, secretName, err)
