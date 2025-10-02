@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -156,7 +157,7 @@ func resolveSecretValue(v any) (string, error) {
 	case string:
 		if strings.HasPrefix(t, "@") {
 			path := strings.TrimPrefix(t, "@")
-			b, err := os.ReadFile(path)
+			b, err := os.ReadFile(mustAbs(path))
 			if err != nil {
 				return "", fmt.Errorf("read file %q: %w", path, err)
 			}
@@ -169,7 +170,7 @@ func resolveSecretValue(v any) (string, error) {
 			if !ok {
 				return "", fmt.Errorf("file value must be string, got %T", fileV)
 			}
-			b, err := os.ReadFile(path)
+			b, err := os.ReadFile(mustAbs(path))
 			if err != nil {
 				return "", fmt.Errorf("read file %q: %w", path, err)
 			}
@@ -249,7 +250,7 @@ func (c *ghClient) doJSON(ctx context.Context, method, url string, in any, out a
 		if err != nil {
 			return err
 		}
-		body = strings.NewReader(string(b))
+		body = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
@@ -737,6 +738,27 @@ func encryptSecret(plaintext string, githubB64PublicKey string) (string, error) 
 	return base64.StdEncoding.EncodeToString(sealed), nil
 }
 
+// Fix ssh private key issue for CRLF
+
+func maybeNormalizeLF(secretName, s string) string {
+	looksLikeKey := strings.Contains(strings.ToUpper(secretName), "KEY") ||
+		strings.Contains(s, "-----BEGIN ") // PEM/OPENSSH markers
+
+	if !looksLikeKey {
+		return s
+	}
+	// Remember if there was a final newline
+	hadFinalNL := strings.HasSuffix(s, "\r\n") || strings.HasSuffix(s, "\n")
+	// Normalize CRLF and lone CR to LF
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	// Preserve a final newline if there was one
+	if hadFinalNL && !strings.HasSuffix(s, "\n") {
+		s += "\n"
+	}
+	return s
+}
+
 // ---------- Main ----------
 
 func main() {
@@ -815,6 +837,7 @@ func main() {
 				if err != nil {
 					log.Fatalf("resolve repo secret %s/%s: %v", repoName, secretName, err)
 				}
+                                plaintext = maybeNormalizeLF(secretName, plaintext)
 				encB64, err := encryptSecret(plaintext, repoKey.Key)
 				if err != nil {
 					log.Fatalf("encrypt repo secret %s/%s: %v", repoName, secretName, err)
@@ -883,6 +906,7 @@ func main() {
 				if err != nil {
 					log.Fatalf("resolve secret %s/%s/%s: %v", repoName, envName, secretName, err)
 				}
+				plaintext = maybeNormalizeLF(secretName, plaintext)
 				encB64, err := encryptSecret(plaintext, key.Key)
 				if err != nil {
 					log.Fatalf("encrypt secret %s/%s/%s: %v", repoName, envName, secretName, err)
@@ -935,3 +959,4 @@ func check(err error) {
 		log.Fatal(err)
 	}
 }
+
